@@ -1,0 +1,83 @@
+# PowerShell Module
+*.psm1-help.xml
+*.dll-help.xml
+
+# Build outputs
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Bb]uild/
+[Rr]elease/
+[Dd]ebug/
+
+# Test Results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Logs
+*.log
+logs/
+*.transcript
+
+# User-specific files
+*.user
+*.userosscache
+*.suo
+*.cache
+
+# IDE
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Configuration (local overrides)
+*.local.json
+*.local.config
+config.local.ps1
+
+# Secrets
+*.key
+*.pfx
+*.cer
+*.pem
+secrets/
+credentials/
+
+# Package files
+*.nupkg
+*.zip
+*.tar.gz
+
+# Documentation build
+docs/_build/
+docs/_site/
+
+# Module dependencies
+modules/
+packages/
+
+# Cache
+.cache/
+*.cache
