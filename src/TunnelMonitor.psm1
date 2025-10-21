@@ -1,7 +1,8 @@
-# OllamaTunnelMonitor.psm1 - Enhanced Background Service Version
+# TunnelMonitor.psm1 - Multi-Service SSH Tunnel Manager
 # ========================================================================================================
-# PRODUCTION-READY SSH TUNNEL & OLLAMA SERVICE MANAGER
-# Windows startup service with model discovery, environment variable management, and fast status API
+# GENERAL-PURPOSE SSH TUNNEL MANAGER WITH MULTI-SERVICE HEALTH MONITORING
+# Windows service integration, automatic recovery, and pluggable health checks
+# Refactored from OllamaTunnelMonitor v1.7.0
 # ========================================================================================================
 
 #Requires -Version 7.1
@@ -24,7 +25,7 @@ $script:TunnelMonitorConfig = @{
     
     # Service Configuration
     Service = @{
-        Name              = "OllamaTunnelService"
+        Name              = "TunnelMonitorService"
         Enabled           = $true
         StartupDelay      = 10        # seconds to wait after system startup
         MaxRetries        = 3
@@ -99,10 +100,10 @@ $script:SSHTunnelExitEvent = $null
 # Determine data path based on context (SYSTEM vs User)
 if ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name -eq 'NT AUTHORITY\SYSTEM') {
     # Running as SYSTEM service - use ProgramData
-    $script:TunnelMonitorDataPath = Join-Path -Path $env:ProgramData -ChildPath "OllamaTunnelMonitor"
+    $script:TunnelMonitorDataPath = Join-Path -Path $env:ProgramData -ChildPath "TunnelMonitor"
 } else {
     # Running as user - use user profile
-    $script:TunnelMonitorDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".OllamaTunnelMonitor"
+    $script:TunnelMonitorDataPath = Join-Path -Path $env:USERPROFILE -ChildPath ".TunnelMonitor"
 }
 $script:TunnelMonitorConfigFile = Join-Path $script:TunnelMonitorDataPath "config.json"
 $script:TunnelMonitorLogFile = Join-Path $script:TunnelMonitorDataPath "service.log"
@@ -448,7 +449,7 @@ function Start-ManagedSSHTunnel {
 
     if ($isSystem) {
         # Load service SSH configuration
-        $serviceConfigPath = "C:\ProgramData\OllamaTunnelMonitor\keys\ssh_config.json"
+        $serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
 
         if (-not (Test-Path $serviceConfigPath)) {
             Write-Log "No service SSH configuration found. Use Set-TunnelConfiguration to configure SSH." -Level $(if ($SilentFail) { 'Warning' } else { 'Error' })
@@ -654,7 +655,7 @@ function Start-ManagedSSHTunnel {
 
                     try {
                         # Check if service is still running before attempting restart
-                        $task = Get-ScheduledTask -TaskName 'OllamaTunnelService' -ErrorAction SilentlyContinue
+                        $task = Get-ScheduledTask -TaskName 'TunnelMonitorService' -ErrorAction SilentlyContinue
                         if ($task -and $task.State -eq 'Running') {
                             Write-Log "Attempting automatic restart of SSH tunnel via exit event" -Level Warning
                             $result = Start-ManagedSSHTunnel -SilentFail
@@ -1043,7 +1044,7 @@ function Get-TunnelStatus {
 
     # Check service - requires admin to see SYSTEM tasks
     try {
-        $task = Get-ScheduledTask -TaskName 'OllamaTunnelService' -ErrorAction SilentlyContinue
+        $task = Get-ScheduledTask -TaskName 'TunnelMonitorService' -ErrorAction SilentlyContinue
         $status.ServiceInstalled = ($null -ne $task)
         if ($task) {
             $status.ServiceRunning = ($task.State -eq 'Running')
@@ -1269,7 +1270,7 @@ function Stop-TunnelService {
 # WINDOWS SERVICE INSTALLATION
 # --------------------------------------------------------------------------------------------------------
 
-function Install-OllamaTunnelService {
+function Install-TunnelService {
     <#
     .SYNOPSIS
     Install the Ollama Tunnel Service as a Windows scheduled task
@@ -1285,10 +1286,10 @@ function Install-OllamaTunnelService {
     Start the service immediately after installation
 
     .EXAMPLE
-    Install-OllamaTunnelService -StartNow
+    Install-TunnelService -StartNow
 
     .EXAMPLE
-    Install-OllamaTunnelService -Uninstall
+    Install-TunnelService -Uninstall
     #>
     [CmdletBinding()]
     param(
@@ -1308,7 +1309,7 @@ function Install-OllamaTunnelService {
     }
     
     if ($Uninstall) {
-        Write-Host "Uninstalling OllamaTunnelService..." -ForegroundColor Yellow
+        Write-Host "Uninstalling TunnelMonitorService..." -ForegroundColor Yellow
 
         try {
             # Stop the service if running
@@ -1326,7 +1327,7 @@ function Install-OllamaTunnelService {
             }
 
             # Clean up installed modules from Program Files
-            $systemModulePath = "C:\Program Files\PowerShell\Modules\OllamaTunnelMonitor"
+            $systemModulePath = "C:\Program Files\PowerShell\Modules\TunnelMonitor"
             if (Test-Path $systemModulePath) {
                 try {
                     Remove-Item -Path $systemModulePath -Recurse -Force
@@ -1362,8 +1363,8 @@ function Install-OllamaTunnelService {
     
     # Create event log source if it doesn't exist (for service logging)
     try {
-        if (-not [System.Diagnostics.EventLog]::SourceExists("OllamaTunnelService")) {
-            [System.Diagnostics.EventLog]::CreateEventSource("OllamaTunnelService", "Application")
+        if (-not [System.Diagnostics.EventLog]::SourceExists("TunnelMonitorService")) {
+            [System.Diagnostics.EventLog]::CreateEventSource("TunnelMonitorService", "Application")
             Write-Host "  Created event log source" -ForegroundColor Gray
         }
     }
@@ -1373,7 +1374,7 @@ function Install-OllamaTunnelService {
     }
 
     # Check if service SSH keys are configured
-    $serviceConfigPath = "C:\ProgramData\OllamaTunnelMonitor\keys\ssh_config.json"
+    $serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
     if (-not (Test-Path $serviceConfigPath)) {
         Write-Host "⚠️  No service SSH keys configured!" -ForegroundColor Yellow
         Write-Host "   The service requires dedicated SSH keys to run as SYSTEM" -ForegroundColor Gray
@@ -1382,22 +1383,22 @@ function Install-OllamaTunnelService {
         Write-Host "   1. Set-TunnelConfiguration -SSHHost <host> -SSHUser <user> -SSHKeyPath <key>" -ForegroundColor Cyan
         Write-Host "   2. Generate SSH keys and configure on remote server" -ForegroundColor Gray
         Write-Host "   3. Get-TunnelStatus -Check Full" -ForegroundColor Cyan
-        Write-Host "   4. Install-OllamaTunnelService" -ForegroundColor Cyan
+        Write-Host "   4. Install-TunnelService" -ForegroundColor Cyan
         return
     }
 
     try {
-        Write-Host "Installing OllamaTunnelService..." -ForegroundColor Cyan
+        Write-Host "Installing TunnelMonitorService..." -ForegroundColor Cyan
 
         # Create ProgramData directory for service data files (logs, keys, etc.)
-        $serviceDataPath = Join-Path -Path $env:ProgramData -ChildPath "OllamaTunnelMonitor"
+        $serviceDataPath = Join-Path -Path $env:ProgramData -ChildPath "TunnelMonitor"
         if (-not (Test-Path $serviceDataPath)) {
             New-Item -Path $serviceDataPath -ItemType Directory -Force | Out-Null
         }
 
         # Install module to system PowerShell modules path for proper discovery
         Write-Host "  Installing module to system modules path..." -ForegroundColor Gray
-        $systemModulePath = "C:\Program Files\PowerShell\Modules\OllamaTunnelMonitor"
+        $systemModulePath = "C:\Program Files\PowerShell\Modules\TunnelMonitor"
 
         # Create module directory with version subfolder for proper module structure
         $moduleVersion = (Import-PowerShellDataFile -Path ($PSCommandPath -replace '\.psm1$', '.psd1')).ModuleVersion
@@ -1411,8 +1412,8 @@ function Install-OllamaTunnelService {
         $moduleSource = $PSCommandPath
         $manifestSource = $moduleSource -replace '\.psm1$', '.psd1'
 
-        $moduleDest = Join-Path $versionedModulePath "OllamaTunnelMonitor.psm1"
-        $manifestDest = Join-Path $versionedModulePath "OllamaTunnelMonitor.psd1"
+        $moduleDest = Join-Path $versionedModulePath "TunnelMonitor.psm1"
+        $manifestDest = Join-Path $versionedModulePath "TunnelMonitor.psd1"
 
         Copy-Item -Path $moduleSource -Destination $moduleDest -Force
         Copy-Item -Path $manifestSource -Destination $manifestDest -Force
@@ -1421,7 +1422,7 @@ function Install-OllamaTunnelService {
 
         # Create enhanced service script with health monitoring
         $serviceScript = @"
-# OllamaTunnelService.ps1 - Enhanced Background Service Script with Health Monitoring
+# TunnelMonitorService.ps1 - Enhanced Background Service Script with Health Monitoring
 # This script runs at Windows startup and manages the Ollama tunnel with automatic recovery
 
 # Start with Continue to allow initialization to proceed even with errors
@@ -1429,11 +1430,11 @@ function Install-OllamaTunnelService {
 `$serviceStartTime = Get-Date
 
 # Create startup debug log immediately
-`$startupDebugLog = "C:\ProgramData\OllamaTunnelMonitor\startup_debug.log"
-`$debugLog = Join-Path `$env:ProgramData "OllamaTunnelMonitor\service_debug.log"
+`$startupDebugLog = "C:\ProgramData\TunnelMonitor\startup_debug.log"
+`$debugLog = Join-Path `$env:ProgramData "TunnelMonitor\service_debug.log"
 
 # Ensure directory exists first
-`$null = New-Item -Path "C:\ProgramData\OllamaTunnelMonitor" -ItemType Directory -Force -ErrorAction SilentlyContinue
+`$null = New-Item -Path "C:\ProgramData\TunnelMonitor" -ItemType Directory -Force -ErrorAction SilentlyContinue
 
 # Startup debug function for immediate logging
 function Write-StartupDebug {
@@ -1496,23 +1497,23 @@ Write-DebugLog "Error action preference changed to: Stop"
 try {
     # Log startup to event log - use "Application" source which always exists
     try {
-        Write-EventLog -LogName Application -Source "Application" -EventId 1000 -EntryType Information -Message "OllamaTunnelService starting at `$serviceStartTime" -ErrorAction SilentlyContinue
+        Write-EventLog -LogName Application -Source "Application" -EventId 1000 -EntryType Information -Message "TunnelMonitorService starting at `$serviceStartTime" -ErrorAction SilentlyContinue
         Write-DebugLog "Event log entry created"
     } catch {
         Write-DebugLog "Event log failed: `$(`$_.Exception.Message)"
     }
 
-    # Import the OllamaTunnelMonitor module from system modules path
-    Write-DebugLog "Importing OllamaTunnelMonitor module from system path"
+    # Import the TunnelMonitor module from system modules path
+    Write-DebugLog "Importing TunnelMonitor module from system path"
     try {
         # First check if module is available
-        `$module = Get-Module -ListAvailable -Name OllamaTunnelMonitor | Select-Object -First 1
+        `$module = Get-Module -ListAvailable -Name TunnelMonitor | Select-Object -First 1
         if (-not `$module) {
-            throw "OllamaTunnelMonitor module not found in system modules path"
+            throw "TunnelMonitor module not found in system modules path"
         }
         Write-DebugLog "Found module at: `$(`$module.Path)"
 
-        Import-Module OllamaTunnelMonitor -Force
+        Import-Module TunnelMonitor -Force
         Write-DebugLog "Module imported successfully"
     }
     catch {
@@ -1524,11 +1525,11 @@ try {
     # Initialize logging
     Write-DebugLog "Initializing tunnel monitor data"
     # Initialize data path - must be hardcoded since we're in a separate script context
-    `$dataPath = "C:\ProgramData\OllamaTunnelMonitor"
+    `$dataPath = "C:\ProgramData\TunnelMonitor"
     if (-not (Test-Path `$dataPath)) {
         New-Item -Path `$dataPath -ItemType Directory -Force | Out-Null
     }
-    Write-Log "OllamaTunnelService started at `$serviceStartTime"
+    Write-Log "TunnelMonitorService started at `$serviceStartTime"
     Write-DebugLog "Service initialization complete"
 
     # Wait for network availability before starting services
@@ -1586,7 +1587,7 @@ try {
 
     # Load service SSH configuration and test accessibility
     Write-StartupDebug "Checking service SSH configuration"
-    `$serviceConfigPath = "C:\ProgramData\OllamaTunnelMonitor\keys\ssh_config.json"
+    `$serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
     if (Test-Path `$serviceConfigPath) {
         try {
             `$svcConfig = Get-Content `$serviceConfigPath -Raw | ConvertFrom-Json
@@ -1738,7 +1739,7 @@ finally {
 }
 "@
         
-        $serviceScriptPath = Join-Path $serviceDataPath "OllamaTunnelService.ps1"
+        $serviceScriptPath = Join-Path $serviceDataPath "TunnelMonitorService.ps1"
         $serviceScript | Set-Content $serviceScriptPath -Encoding UTF8
         Write-Host "  Service script created: $serviceScriptPath" -ForegroundColor Gray
         
@@ -1785,7 +1786,7 @@ finally {
 
             $wakeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument @"
 -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command "& {
-    Import-Module OllamaTunnelMonitor
+    Import-Module TunnelMonitor
     Write-EventLog -LogName Application -Source 'Application' -EventId 1002 -EntryType Information -Message 'System wake detected - restarting SSH tunnel'
     Stop-ManagedSSHTunnel -Force
     Start-Sleep -Seconds 2
@@ -1818,7 +1819,7 @@ finally {
             Write-Host "    ⚠️  Failed to register wake task: $($_.Exception.Message)" -ForegroundColor Yellow
         }
 
-        Write-Host "✅ OllamaTunnelService installed successfully!" -ForegroundColor Green
+        Write-Host "✅ TunnelMonitorService installed successfully!" -ForegroundColor Green
         Write-Host ""
         Write-Host "📋 Service Details:" -ForegroundColor White
         Write-Host "   Name: $serviceName" -ForegroundColor Gray
@@ -1905,4 +1906,4 @@ if (Test-Path $script:TunnelMonitorConfigFile) {
 # Module exports are handled by the manifest (.psd1) file
 
 # Module loaded silently - no output to avoid profile clutter
-# For help, use: Get-Command -Module OllamaTunnelMonitor
+# For help, use: Get-Command -Module TunnelMonitor
