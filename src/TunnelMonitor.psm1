@@ -1586,17 +1586,132 @@ function Install-TunnelService {
         Write-Verbose "Event log source may already exist"
     }
 
-    # Check if service SSH keys are configured
+    # Setup service SSH keys and configuration
+    $serviceKeysPath = "C:\ProgramData\TunnelMonitor\keys"
+    $serviceKeyFile = Join-Path $serviceKeysPath "service_key"
     $serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
-    if (-not (Test-Path $serviceConfigPath)) {
-        Write-Host "⚠️  No service SSH keys configured!" -ForegroundColor Yellow
-        Write-Host "   The service requires dedicated SSH keys to run as SYSTEM" -ForegroundColor Gray
+
+    # Check if SSH keys need to be generated
+    if (-not (Test-Path $serviceKeyFile)) {
         Write-Host ""
-        Write-Host "   Please run the following commands first:" -ForegroundColor White
-        Write-Host "   1. Set-TunnelConfiguration -SSHHost <host> -SSHUser <user> -SSHKeyPath <key>" -ForegroundColor Cyan
-        Write-Host "   2. Generate SSH keys and configure on remote server" -ForegroundColor Gray
-        Write-Host "   3. Get-TunnelStatus -Check Full" -ForegroundColor Cyan
-        Write-Host "   4. Install-TunnelService" -ForegroundColor Cyan
+        Write-Host "=== SSH Service Key Setup ===" -ForegroundColor Cyan
+        Write-Host "No service SSH keys found. Generating new keys for SYSTEM account..." -ForegroundColor Yellow
+        Write-Host ""
+
+        # Create keys directory
+        if (-not (Test-Path $serviceKeysPath)) {
+            New-Item -Path $serviceKeysPath -ItemType Directory -Force | Out-Null
+        }
+
+        # Prompt for SSH connection details
+        $sshHost = Read-Host "Enter SSH host (e.g., server.example.com or 192.168.1.100)"
+        $sshUser = Read-Host "Enter SSH username (e.g., user)"
+
+        if ([string]::IsNullOrWhiteSpace($sshHost) -or [string]::IsNullOrWhiteSpace($sshUser)) {
+            Write-Error "SSH host and user are required"
+            return
+        }
+
+        # Generate SSH key pair
+        Write-Host "  Generating Ed25519 key pair..." -ForegroundColor Gray
+        $sshKeyGenOutput = ssh-keygen -t ed25519 -f $serviceKeyFile -N '""' -C "TunnelMonitorService-SYSTEM" 2>&1
+
+        if (-not (Test-Path $serviceKeyFile)) {
+            Write-Error "Failed to generate SSH key: $sshKeyGenOutput"
+            return
+        }
+
+        Write-Host "  SSH key pair generated" -ForegroundColor Green
+
+        # Set SYSTEM ownership and permissions
+        Write-Host "  Setting SYSTEM account permissions..." -ForegroundColor Gray
+
+        try {
+            # Get SYSTEM account
+            $systemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+            $systemAccount = $systemSid.Translate([System.Security.Principal.NTAccount])
+
+            # Set ownership to SYSTEM
+            $acl = Get-Acl $serviceKeyFile
+            $acl.SetOwner($systemAccount)
+            Set-Acl -Path $serviceKeyFile -AclObject $acl
+
+            # Remove all permissions and set SYSTEM-only access
+            $acl = Get-Acl $serviceKeyFile
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+
+            # Grant SYSTEM full control
+            $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $systemAccount, "FullControl", "Allow"
+            )
+            $acl.AddAccessRule($systemRule)
+
+            # Grant Administrators read access
+            $adminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+            $adminAccount = $adminSid.Translate([System.Security.Principal.NTAccount])
+            $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $adminAccount, "Read", "Allow"
+            )
+            $acl.AddAccessRule($adminRule)
+
+            Set-Acl -Path $serviceKeyFile -AclObject $acl
+            Write-Host "  Permissions set (SYSTEM: FullControl, Admins: Read)" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Could not set SYSTEM permissions: $($_.Exception.Message)"
+            Write-Warning "Service may not be able to read the key. You may need to set permissions manually."
+        }
+
+        # Create service configuration
+        $serviceConfig = @{
+            RemoteHost = $sshHost
+            RemoteUser = $sshUser
+            PrivateKeyPath = $serviceKeyFile
+            LocalPort = 11434
+            RemotePort = 11434
+        }
+
+        # Save configuration
+        $serviceConfig | ConvertTo-Json -Depth 10 | Set-Content $serviceConfigPath -Encoding UTF8
+        Write-Host "  Configuration saved" -ForegroundColor Green
+
+        # Display public key
+        $publicKey = Get-Content "${serviceKeyFile}.pub"
+        Write-Host ""
+        Write-Host "=== PUBLIC KEY - Add this to your remote server ===" -ForegroundColor Cyan
+        Write-Host $publicKey -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "On your remote server ($sshHost), run:" -ForegroundColor White
+        Write-Host "  mkdir -p ~/.ssh && chmod 700 ~/.ssh" -ForegroundColor Gray
+        Write-Host "  echo '$publicKey' >> ~/.ssh/authorized_keys" -ForegroundColor Gray
+        Write-Host "  chmod 600 ~/.ssh/authorized_keys" -ForegroundColor Gray
+        Write-Host ""
+
+        # Copy to clipboard if possible
+        try {
+            $publicKey | Set-Clipboard
+            Write-Host "  Public key copied to clipboard!" -ForegroundColor Green
+        }
+        catch {
+            # Clipboard not available, continue anyway
+        }
+
+        # Prompt to continue
+        Write-Host ""
+        $continue = Read-Host "Have you added the public key to $sshHost ? (yes/no)"
+        if ($continue -ne "yes" -and $continue -ne "y") {
+            Write-Host ""
+            Write-Host "Installation paused. Add the public key to your remote server, then run:" -ForegroundColor Yellow
+            Write-Host "  Install-TunnelService -StartNow" -ForegroundColor Cyan
+            return
+        }
+
+        Write-Host ""
+    }
+    elseif (-not (Test-Path $serviceConfigPath)) {
+        Write-Host "⚠️  SSH keys exist but configuration is missing!" -ForegroundColor Yellow
+        Write-Host "   Run Set-TunnelConfiguration to create the config, or delete the keys and reinstall." -ForegroundColor Gray
         return
     }
 
