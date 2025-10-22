@@ -1,8 +1,7 @@
-# TunnelMonitor.psm1 - Multi-Service SSH Tunnel Manager
+# TunnelMonitor.psm1 - Enhanced Background Service Version
 # ========================================================================================================
-# GENERAL-PURPOSE SSH TUNNEL MANAGER WITH MULTI-SERVICE HEALTH MONITORING
-# Windows service integration, automatic recovery, and pluggable health checks
-# Refactored from OllamaTunnelMonitor v1.7.0
+# PRODUCTION-READY SSH TUNNEL & OLLAMA SERVICE MANAGER
+# Windows startup service with model discovery, environment variable management, and fast status API
 # ========================================================================================================
 
 #Requires -Version 7.1
@@ -62,10 +61,8 @@ $script:TunnelMonitorConfig = @{
 
     # Additional Services Configuration (Multi-Port Forwarding)
     AdditionalServices = @{
-        # ServiceName = @{LocalPort=X; RemotePort=Y; RemoteHost="localhost"}
-        # OR simplified: ServiceName = Port (assumes same local/remote)
-        # Example: VisionAPI = 5000
-        # Example: Samba = @{LocalPort=445; RemotePort=445; RemoteHost="localhost"}
+        TransformersTunnel = @{LocalPort = 5000; RemotePort = 5000; RemoteHost = "localhost"}
+        Samba = @{LocalPort = 445; RemotePort = 445; RemoteHost = "localhost"}
     }
 }
 
@@ -288,30 +285,28 @@ function Get-ExistingSSHTunnel {
     param()
 
     try {
-        # Build list of all expected forwarded ports
-        $expectedPorts = @($script:TunnelMonitorConfig.Target.LocalPort)
-
-        foreach ($svcName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
-            $expectedPorts += $script:TunnelMonitorConfig.AdditionalServices[$svcName].LocalPort
-        }
-
         # Check for SSH processes with our specific tunnel configuration
         $sshProcesses = Get-Process -Name "ssh" -ErrorAction SilentlyContinue
 
         foreach ($process in $sshProcesses) {
             try {
                 $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue).CommandLine
+                # Check for our standard tunnel pattern - look for main Ollama port or any additional service ports
+                $mainPortMatch = $commandLine -like "*-L*11434:localhost:11434*" -or
+                                 $commandLine -like "*-L*11434:*:11434*" -or
+                                 $commandLine -like "*$($script:TunnelMonitorConfig.Target.LocalPort):localhost:$($script:TunnelMonitorConfig.Target.RemotePort)*"
 
-                # Check if command line contains ANY of our configured ports
-                $foundPort = $false
-                foreach ($port in $expectedPorts) {
-                    if ($commandLine -like "*-L*${port}:*" -or $commandLine -like "*-L*:*:${port}*") {
-                        $foundPort = $true
+                # Also check for additional service ports
+                $additionalPortMatch = $false
+                foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+                    $service = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+                    if ($commandLine -like "*-L*$($service.LocalPort):*:$($service.RemotePort)*") {
+                        $additionalPortMatch = $true
                         break
                     }
                 }
 
-                if ($foundPort) {
+                if ($mainPortMatch -or $additionalPortMatch) {
                     Write-Log "Found existing SSH tunnel (PID: $($process.Id))" -Level Debug
                     return @{
                         ProcessId = $process.Id
@@ -469,11 +464,23 @@ function Start-ManagedSSHTunnel {
     $isSystem = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name -eq 'NT AUTHORITY\SYSTEM'
 
     if ($isSystem) {
-        # Load service SSH configuration
-        $serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
+        # Load service SSH configuration (check both TunnelMonitor and OllamaTunnelMonitor paths)
+        $serviceConfigPaths = @(
+            "C:\ProgramData\TunnelMonitor\keys\ssh_config.json",
+            "C:\ProgramData\OllamaTunnelMonitor\keys\ssh_config.json"
+        )
 
-        if (-not (Test-Path $serviceConfigPath)) {
-            Write-Log "No service SSH configuration found. Use Set-TunnelConfiguration to configure SSH." -Level $(if ($SilentFail) { 'Warning' } else { 'Error' })
+        $serviceConfigPath = $null
+        foreach ($path in $serviceConfigPaths) {
+            if (Test-Path $path) {
+                $serviceConfigPath = $path
+                Write-Log "Using service SSH config from: $path"
+                break
+            }
+        }
+
+        if (-not $serviceConfigPath) {
+            Write-Log "No service SSH configuration found. TunnelMonitor can use existing OllamaTunnelMonitor keys." -Level $(if ($SilentFail) { 'Warning' } else { 'Error' })
             if (-not $SilentFail) {
                 Write-Log "Setup: Set-TunnelConfiguration -SSHHost <host> -SSHUser <user> -SSHKeyPath <key>" -Level Warning
             }
@@ -502,12 +509,7 @@ function Start-ManagedSSHTunnel {
                 try {
                     $acl = Get-Acl $serviceConfig.PrivateKeyPath
                     Write-Log "Key owner: $($acl.Owner)" -Level Debug
-                    # Build permission string to avoid parser issues
-                    $accessList = $acl.Access | ForEach-Object {
-                        $identity = $_.IdentityReference
-                        $rights = $_.FileSystemRights
-                        "${identity}: ${rights}"
-                    }
+                    $accessList = $acl.Access | ForEach-Object { "$($_.IdentityReference): $($_.FileSystemRights)" }
                     Write-Log "Key permissions: $($accessList -join '; ')" -Level Debug
                 }
                 catch {
@@ -568,22 +570,15 @@ function Start-ManagedSSHTunnel {
             "-L", "${localPortNum}:localhost:${remotePortNum}"
         )
 
-        # Add additional services (multi-port forwarding)
-        if ($script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
-            Write-Log "Configuring $($script:TunnelMonitorConfig.AdditionalServices.Count) additional service(s) for forwarding"
-            foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
-                $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+        # Add additional service port forwards
+        foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+            $service = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+            $serviceLocalPort = [int]$service.LocalPort
+            $serviceRemotePort = [int]$service.RemotePort
+            $serviceRemoteHost = if ($service.RemoteHost) { $service.RemoteHost } else { "localhost" }
 
-                # Build port mapping string to avoid parser issues with colons after subexpressions
-                $localP = $svc.LocalPort
-                $remoteH = $svc.RemoteHost
-                $remoteP = $svc.RemotePort
-                $portMapping = "${localP}:${remoteH}:${remoteP}"
-
-                $sshArgs += "-L"
-                $sshArgs += $portMapping
-                Write-Log "  - ${serviceName}: $localP -> ${remoteH}:${remoteP}"
-            }
+            $sshArgs += @("-L", "${serviceLocalPort}:${serviceRemoteHost}:${serviceRemotePort}")
+            Write-Log "Adding port forward for $serviceName`: $serviceLocalPort -> ${serviceRemoteHost}:${serviceRemotePort}"
         }
 
         # Add SSH options
@@ -691,12 +686,12 @@ function Start-ManagedSSHTunnel {
             # Register the exit event handler
             $script:SSHTunnelExitEvent = Register-ObjectEvent -InputObject $processInfo -EventName Exited -Action {
                 $exitCode = $Event.SourceObject.ExitCode
-                $pid = $Event.SourceObject.Id
+                $processId = $Event.SourceObject.Id
 
                 # Check if this is an intentional stop or a restart is already in progress
                 if (-not $script:ServiceStopping -and -not $script:RestartInProgress) {
                     $script:RestartInProgress = $true
-                    Write-Log "SSH tunnel process $pid exited unexpectedly with code $exitCode" -Level Error
+                    Write-Log "SSH tunnel process $processId exited unexpectedly with code $exitCode" -Level Error
 
                     # Brief delay to prevent rapid restart loops
                     Start-Sleep -Seconds 5
@@ -1015,95 +1010,103 @@ function Export-ModelEnvironmentVariables {
 # UNIFIED STATUS AND CONFIGURATION FUNCTIONS
 # --------------------------------------------------------------------------------------------------------
 
-function Test-TCPPort {
-    <#
-    .SYNOPSIS
-    Test TCP connectivity to a local port
-
-    .DESCRIPTION
-    Internal helper function to test if a TCP port is listening
-
-    .PARAMETER Port
-    The port number to test
-
-    .PARAMETER Timeout
-    Timeout in milliseconds (default 2000)
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [int]$Port,
-
-        [int]$Timeout = 2000
-    )
-
-    try {
-        $tcpClient = New-Object System.Net.Sockets.TcpClient
-        $connect = $tcpClient.BeginConnect("localhost", $Port, $null, $null)
-        $portStatus = $connect.AsyncWaitHandle.WaitOne($Timeout, $false)
-        if ($portStatus) { $tcpClient.EndConnect($connect) }
-        $tcpClient.Close()
-        return $portStatus
-    }
-    catch {
-        return $false
-    }
-}
-
 function Test-TunnelPorts {
     <#
     .SYNOPSIS
-    Test connectivity to all forwarded tunnel ports
+    Test connectivity to all configured tunnel ports
 
     .DESCRIPTION
-    Performs quick TCP connectivity checks on main service and all additional services.
-    Does NOT perform HTTP/application-level checks - just port listening status.
+    Tests TCP connectivity to the main Ollama port and all additional service ports.
+    Returns detailed status for each port including response time.
+
+    .PARAMETER TimeoutMs
+    Connection timeout in milliseconds (default: 2000)
 
     .EXAMPLE
     Test-TunnelPorts
 
     .EXAMPLE
-    Test-TunnelPorts | Where-Object {-not $_.Listening}  # Show only failed ports
+    Test-TunnelPorts -TimeoutMs 5000
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [int]$TimeoutMs = 2000
+    )
 
-    $results = @()
+    $results = [System.Collections.ArrayList]::new()
 
-    # Test main service
+    # Test main Ollama port
     $mainPort = $script:TunnelMonitorConfig.Target.LocalPort
-    $start = Get-Date
-    $listening = Test-TCPPort -Port $mainPort
-    $responseTime = if ($listening) {
-        [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
-    } else {
-        -1
+    $mainResult = [PSCustomObject]@{
+        ServiceName = "Ollama"
+        LocalPort = $mainPort
+        RemotePort = $script:TunnelMonitorConfig.Target.RemotePort
+        RemoteHost = "localhost"
+        Listening = $false
+        ResponseTimeMs = -1
+        Status = "Unknown"
     }
 
-    $results += [PSCustomObject]@{
-        ServiceName = "Main"
-        Port = $mainPort
-        Listening = $listening
-        ResponseTimeMs = $responseTime
-    }
-
-    # Test additional services
-    foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
-        $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+    try {
         $start = Get-Date
-        $listening = Test-TCPPort -Port $svc.LocalPort
-        $responseTime = if ($listening) {
-            [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
-        } else {
-            -1
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $connect = $tcpClient.BeginConnect("localhost", $mainPort, $null, $null)
+        $success = $connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+
+        if ($success) {
+            $tcpClient.EndConnect($connect)
+            $mainResult.Listening = $true
+            $mainResult.ResponseTimeMs = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
+            $mainResult.Status = "Connected"
+        }
+        else {
+            $mainResult.Status = "Timeout"
+        }
+        $tcpClient.Close()
+    }
+    catch {
+        $mainResult.Status = "Failed: $($_.Exception.Message)"
+    }
+
+    $null = $results.Add($mainResult)
+
+    # Test additional service ports
+    foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+        $service = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+        $servicePort = $service.LocalPort
+
+        $serviceResult = [PSCustomObject]@{
+            ServiceName = $serviceName
+            LocalPort = $servicePort
+            RemotePort = $service.RemotePort
+            RemoteHost = if ($service.RemoteHost) { $service.RemoteHost } else { "localhost" }
+            Listening = $false
+            ResponseTimeMs = -1
+            Status = "Unknown"
         }
 
-        $results += [PSCustomObject]@{
-            ServiceName = $serviceName
-            Port = $svc.LocalPort
-            Listening = $listening
-            ResponseTimeMs = $responseTime
+        try {
+            $start = Get-Date
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $connect = $tcpClient.BeginConnect("localhost", $servicePort, $null, $null)
+            $success = $connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+
+            if ($success) {
+                $tcpClient.EndConnect($connect)
+                $serviceResult.Listening = $true
+                $serviceResult.ResponseTimeMs = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
+                $serviceResult.Status = "Connected"
+            }
+            else {
+                $serviceResult.Status = "Timeout"
+            }
+            $tcpClient.Close()
         }
+        catch {
+            $serviceResult.Status = "Failed: $($_.Exception.Message)"
+        }
+
+        $null = $results.Add($serviceResult)
     }
 
     return $results
@@ -1145,8 +1148,8 @@ function Get-TunnelStatus {
         ModelCount = 0
         ResponseTimeMs = -1
         Status = "Unknown"
-        AdditionalServices = @()
         Timestamp = Get-Date
+        AdditionalServices = @()
     }
 
     # Check port connectivity first (doesn't require admin)
@@ -1228,27 +1231,42 @@ function Get-TunnelStatus {
         }
     }
 
-    # Check additional services (if not Quick mode)
-    if ($Check -ne 'Quick' -and $script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
+    # Check additional services if requested (Service or Full check)
+    if ($Check -in 'Service', 'Full') {
         foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
-            $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+            $service = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+            $servicePort = $service.LocalPort
 
-            $svcStatus = [PSCustomObject]@{
+            $serviceStatus = [PSCustomObject]@{
                 Name = $serviceName
-                Port = $svc.LocalPort
-                Listening = (Test-TCPPort -Port $svc.LocalPort)
+                LocalPort = $servicePort
+                RemotePort = $service.RemotePort
+                Listening = $false
+                ResponseTimeMs = -1
             }
 
-            $status.AdditionalServices += $svcStatus
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $start = Get-Date
+                $connect = $tcpClient.BeginConnect("localhost", $servicePort, $null, $null)
+                $portStatus = $connect.AsyncWaitHandle.WaitOne(2000, $false)
+                if ($portStatus) {
+                    $tcpClient.EndConnect($connect)
+                    $serviceStatus.Listening = $true
+                    $serviceStatus.ResponseTimeMs = [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
+                }
+                $tcpClient.Close()
+            }
+            catch {
+                $serviceStatus.Listening = $false
+            }
+
+            $status.AdditionalServices += $serviceStatus
         }
     }
 
     # Determine overall status
-    # If any additional service is down, mark as Partial
-    $additionalServicesDown = $status.AdditionalServices | Where-Object {-not $_.Listening}
-
-    $status.Status = if ($status.APIResponding -and $status.PortListening -and -not $additionalServicesDown) { "Operational" }
-                    elseif (($status.PortListening -or $status.APIResponding) -and $additionalServicesDown) { "Partial" }
+    $status.Status = if ($status.APIResponding -and $status.PortListening) { "Operational" }
                     elseif ($status.PortListening) { "Partial" }
                     elseif ($status.TunnelProcessAlive) { "Connecting" }
                     elseif ($status.ServiceRunning) { "Starting" }
@@ -1263,15 +1281,6 @@ function Set-TunnelConfiguration {
     <#
     .SYNOPSIS
     Configure SSH tunnel settings
-
-    .DESCRIPTION
-    Configure SSH tunnel with optional multi-service port forwarding.
-
-    .PARAMETER AdditionalServices
-    Hashtable of additional services to forward. Key = ServiceName, Value = Port or @{LocalPort=X; RemotePort=Y}
-
-    .EXAMPLE
-    Set-TunnelConfiguration -SSHHost "server" -SSHUser "user" -AdditionalServices @{VisionAPI=5000; Samba=445}
     #>
     [CmdletBinding()]
     param(
@@ -1279,8 +1288,7 @@ function Set-TunnelConfiguration {
         [string]$SSHUser,
         [string]$SSHKeyPath,
         [int]$LocalPort = 11434,
-        [int]$RemotePort = 11434,
-        [hashtable]$AdditionalServices
+        [int]$RemotePort = 11434
     )
 
     # Update configuration
@@ -1300,52 +1308,11 @@ function Set-TunnelConfiguration {
         $script:TunnelMonitorConfig.Target.RemotePort = $RemotePort
     }
 
-    # Handle additional services
-    if ($PSBoundParameters.ContainsKey('AdditionalServices')) {
-        $script:TunnelMonitorConfig.AdditionalServices = @{}
-
-        foreach ($serviceName in $AdditionalServices.Keys) {
-            $serviceConfig = $AdditionalServices[$serviceName]
-
-            if ($serviceConfig -is [int]) {
-                # Simplified: ServiceName = Port (same local/remote)
-                $script:TunnelMonitorConfig.AdditionalServices[$serviceName] = @{
-                    LocalPort = $serviceConfig
-                    RemotePort = $serviceConfig
-                    RemoteHost = "localhost"
-                }
-                Write-Verbose "Added service '$serviceName' forwarding port $serviceConfig"
-            }
-            elseif ($serviceConfig -is [hashtable]) {
-                # Full config: ServiceName = @{LocalPort=X; RemotePort=Y; RemoteHost=Z}
-                $localPort = $serviceConfig.LocalPort
-                $remotePort = if ($serviceConfig.ContainsKey('RemotePort')) { $serviceConfig.RemotePort } else { $localPort }
-                $remoteHost = if ($serviceConfig.ContainsKey('RemoteHost')) { $serviceConfig.RemoteHost } else { "localhost" }
-
-                $script:TunnelMonitorConfig.AdditionalServices[$serviceName] = @{
-                    LocalPort = $localPort
-                    RemotePort = $remotePort
-                    RemoteHost = $remoteHost
-                }
-                Write-Verbose "Added service '$serviceName' forwarding $localPort -> ${remoteHost}:${remotePort}"
-            }
-            else {
-                Write-Warning "Invalid configuration for service '$serviceName' - must be int or hashtable"
-            }
-        }
-    }
-
     # Save to file
     Initialize-DataPath
     $script:TunnelMonitorConfig | ConvertTo-Json -Depth 10 | Set-Content -Path $script:TunnelMonitorConfigFile -Encoding UTF8
 
-    if ($script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
-        Write-Host "Configuration updated successfully with $($script:TunnelMonitorConfig.AdditionalServices.Count) additional service(s)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "Configuration updated successfully" -ForegroundColor Green
-    }
-
+    Write-Host "Configuration updated successfully" -ForegroundColor Green
     return $script:TunnelMonitorConfig.Target
 }
 
@@ -1357,6 +1324,18 @@ function Get-TunnelConfiguration {
     [CmdletBinding()]
     param()
 
+    # Build additional services array for display
+    $additionalSvcs = @()
+    foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+        $service = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+        $additionalSvcs += [PSCustomObject]@{
+            Name = $serviceName
+            LocalPort = $service.LocalPort
+            RemotePort = $service.RemotePort
+            RemoteHost = if ($service.RemoteHost) { $service.RemoteHost } else { "localhost" }
+        }
+    }
+
     return [PSCustomObject]@{
         SSHHost = $script:TunnelMonitorConfig.Target.SSHHost
         SSHUser = $script:TunnelMonitorConfig.Target.SSHUser
@@ -1364,7 +1343,7 @@ function Get-TunnelConfiguration {
         LocalPort = $script:TunnelMonitorConfig.Target.LocalPort
         RemotePort = $script:TunnelMonitorConfig.Target.RemotePort
         APIUrl = $script:TunnelMonitorConfig.Target.OllamaApiUrl
-        AdditionalServices = $script:TunnelMonitorConfig.AdditionalServices
+        AdditionalServices = $additionalSvcs
     }
 }
 
@@ -1587,256 +1566,39 @@ function Install-TunnelService {
         Write-Verbose "Event log source may already exist"
     }
 
-    # Setup service SSH keys and configuration
-    $serviceKeysPath = "C:\ProgramData\TunnelMonitor\keys"
-    $serviceKeyFile = Join-Path $serviceKeysPath "service_key"
-    $serviceConfigPath = "C:\ProgramData\TunnelMonitor\keys\ssh_config.json"
+    # Check if service SSH keys are configured
+    # Check both TunnelMonitor and OllamaTunnelMonitor paths (backward compatibility)
+    $serviceConfigPaths = @(
+        "C:\ProgramData\TunnelMonitor\keys\ssh_config.json",
+        "C:\ProgramData\OllamaTunnelMonitor\keys\ssh_config.json"
+    )
 
-    # Check if SSH keys need to be generated
-    if (-not (Test-Path $serviceKeyFile)) {
-        Write-Host ""
-        Write-Host "=== SSH Service Key Setup ===" -ForegroundColor Cyan
-        Write-Host "No service SSH keys found. Generating new keys for SYSTEM account..." -ForegroundColor Yellow
-        Write-Host ""
-
-        # Create keys directory
-        if (-not (Test-Path $serviceKeysPath)) {
-            New-Item -Path $serviceKeysPath -ItemType Directory -Force | Out-Null
+    $serviceConfigPath = $null
+    foreach ($path in $serviceConfigPaths) {
+        if (Test-Path $path) {
+            $serviceConfigPath = $path
+            Write-Host "  Using existing SSH keys from: $path" -ForegroundColor Gray
+            break
         }
-
-        # Prompt for SSH connection details
-        $sshHost = Read-Host "Enter SSH host (e.g., server.example.com or 192.168.1.100)"
-        $sshUser = Read-Host "Enter SSH username (e.g., user)"
-
-        if ([string]::IsNullOrWhiteSpace($sshHost) -or [string]::IsNullOrWhiteSpace($sshUser)) {
-            Write-Error "SSH host and user are required"
-            return
-        }
-
-        # Prompt for additional services
-        Write-Host ""
-        $addServices = Read-Host "Do you want to forward additional services? (yes/no)"
-        $additionalServices = @{}
-
-        if ($addServices -eq "yes" -or $addServices -eq "y") {
-            Write-Host ""
-            Write-Host "Enter service names and ports. Press Enter with blank name to finish." -ForegroundColor Gray
-            Write-Host "Common examples: VisionAPI=5000, Samba=445, Jupyter=8888" -ForegroundColor Gray
-            Write-Host ""
-
-            while ($true) {
-                $svcName = Read-Host "Service name (or blank to finish)"
-                if ([string]::IsNullOrWhiteSpace($svcName)) {
-                    break
-                }
-
-                $portInput = Read-Host "Port for ${svcName}"
-                if ([string]::IsNullOrWhiteSpace($portInput)) {
-                    Write-Warning "Skipping $svcName - no port specified"
-                    continue
-                }
-
-                # Try to parse as integer
-                $port = 0
-                if ([int]::TryParse($portInput, [ref]$port)) {
-                    $additionalServices[$svcName] = @{
-                        LocalPort = $port
-                        RemotePort = $port
-                        RemoteHost = "localhost"
-                    }
-                    Write-Host "  Added: $svcName on port $port" -ForegroundColor Green
-                }
-                else {
-                    Write-Warning "Invalid port number: $portInput"
-                }
-            }
-
-            if ($additionalServices.Count -gt 0) {
-                Write-Host ""
-                Write-Host "Additional services configured:" -ForegroundColor Cyan
-                foreach ($svc in $additionalServices.Keys) {
-                    Write-Host "  - ${svc}: $($additionalServices[$svc].LocalPort)" -ForegroundColor Gray
-                }
-            }
-        }
-
-        Write-Host ""
-
-        # Generate SSH key pair
-        Write-Host "  Generating Ed25519 key pair..." -ForegroundColor Gray
-        $sshKeyGenOutput = ssh-keygen -t ed25519 -f $serviceKeyFile -N '""' -C "TunnelMonitorService-SYSTEM" 2>&1
-
-        if (-not (Test-Path $serviceKeyFile)) {
-            Write-Error "Failed to generate SSH key: $sshKeyGenOutput"
-            return
-        }
-
-        Write-Host "  SSH key pair generated" -ForegroundColor Green
-
-        # Set SYSTEM ownership and permissions
-        Write-Host "  Setting SYSTEM account permissions..." -ForegroundColor Gray
-
-        try {
-            # Get SYSTEM account
-            $systemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
-            $systemAccount = $systemSid.Translate([System.Security.Principal.NTAccount])
-
-            # Set ownership to SYSTEM
-            $acl = Get-Acl $serviceKeyFile
-            $acl.SetOwner($systemAccount)
-            Set-Acl -Path $serviceKeyFile -AclObject $acl
-
-            # Remove all permissions and set SYSTEM-only access
-            $acl = Get-Acl $serviceKeyFile
-            $acl.SetAccessRuleProtection($true, $false)
-            $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
-
-            # Grant SYSTEM full control
-            $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $systemAccount, "FullControl", "Allow"
-            )
-            $acl.AddAccessRule($systemRule)
-
-            # Grant Administrators read access
-            $adminSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
-            $adminAccount = $adminSid.Translate([System.Security.Principal.NTAccount])
-            $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $adminAccount, "Read", "Allow"
-            )
-            $acl.AddAccessRule($adminRule)
-
-            Set-Acl -Path $serviceKeyFile -AclObject $acl
-            Write-Host "  Permissions set (SYSTEM: FullControl, Admins: Read)" -ForegroundColor Green
-        }
-        catch {
-            Write-Warning "Could not set SYSTEM permissions: $($_.Exception.Message)"
-            Write-Warning "Service may not be able to read the key. You may need to set permissions manually."
-        }
-
-        # Create service configuration
-        $serviceConfig = @{
-            RemoteHost = $sshHost
-            RemoteUser = $sshUser
-            PrivateKeyPath = $serviceKeyFile
-            LocalPort = 11434
-            RemotePort = 11434
-        }
-
-        # Add additional services if configured
-        if ($additionalServices.Count -gt 0) {
-            $serviceConfig.AdditionalServices = $additionalServices
-        }
-
-        # Save configuration
-        $serviceConfig | ConvertTo-Json -Depth 10 | Set-Content $serviceConfigPath -Encoding UTF8
-        Write-Host "  Configuration saved" -ForegroundColor Green
-
-        # Display public key
-        $publicKey = Get-Content "${serviceKeyFile}.pub"
-        Write-Host ""
-        Write-Host "=== PUBLIC KEY - Add this to your remote server ===" -ForegroundColor Cyan
-        Write-Host $publicKey -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "On your remote server ($sshHost), run:" -ForegroundColor White
-        Write-Host "  mkdir -p ~/.ssh && chmod 700 ~/.ssh" -ForegroundColor Gray
-        Write-Host "  echo '$publicKey' >> ~/.ssh/authorized_keys" -ForegroundColor Gray
-        Write-Host "  chmod 600 ~/.ssh/authorized_keys" -ForegroundColor Gray
-        Write-Host ""
-
-        # Copy to clipboard if possible
-        try {
-            $publicKey | Set-Clipboard
-            Write-Host "  Public key copied to clipboard!" -ForegroundColor Green
-        }
-        catch {
-            # Clipboard not available, continue anyway
-        }
-
-        # Prompt to continue
-        Write-Host ""
-        $continue = Read-Host "Have you added the public key to $sshHost ? (yes/no)"
-        if ($continue -ne "yes" -and $continue -ne "y") {
-            Write-Host ""
-            Write-Host "Installation paused. Add the public key to your remote server, then run:" -ForegroundColor Yellow
-            Write-Host "  Install-TunnelService -StartNow" -ForegroundColor Cyan
-            return
-        }
-
-        Write-Host ""
     }
-    else {
-        # Keys and config exist - check if we should add additional services
-        if (Test-Path $serviceConfigPath) {
-            try {
-                $existingConfig = Get-Content $serviceConfigPath -Raw | ConvertFrom-Json -AsHashtable
 
-                # Check if AdditionalServices is missing or empty
-                $hasAdditionalServices = $existingConfig.ContainsKey('AdditionalServices') -and
-                                        $existingConfig.AdditionalServices -and
-                                        $existingConfig.AdditionalServices.Count -gt 0
-
-                if (-not $hasAdditionalServices) {
-                    Write-Host ""
-                    Write-Host "Existing SSH keys found. Configuration loaded." -ForegroundColor Green
-                    Write-Host ""
-
-                    # Prompt to add additional services
-                    $addServices = Read-Host "Do you want to add additional services to forward? (yes/no)"
-                    $additionalServices = @{}
-
-                    if ($addServices -eq "yes" -or $addServices -eq "y") {
-                        Write-Host ""
-                        Write-Host "Enter service names and ports. Press Enter with blank name to finish." -ForegroundColor Gray
-                        Write-Host "Common examples: VisionAPI=5000, Samba=445, Jupyter=8888" -ForegroundColor Gray
-                        Write-Host ""
-
-                        while ($true) {
-                            $svcName = Read-Host "Service name (or blank to finish)"
-                            if ([string]::IsNullOrWhiteSpace($svcName)) {
-                                break
-                            }
-
-                            $portInput = Read-Host "Port for ${svcName}"
-                            if ([string]::IsNullOrWhiteSpace($portInput)) {
-                                Write-Warning "Skipping $svcName - no port specified"
-                                continue
-                            }
-
-                            $port = 0
-                            if ([int]::TryParse($portInput, [ref]$port)) {
-                                $additionalServices[$svcName] = @{
-                                    LocalPort = $port
-                                    RemotePort = $port
-                                    RemoteHost = "localhost"
-                                }
-                                Write-Host "  Added: $svcName on port $port" -ForegroundColor Green
-                            }
-                            else {
-                                Write-Warning "Invalid port number: $portInput"
-                            }
-                        }
-
-                        # Update existing config with additional services
-                        if ($additionalServices.Count -gt 0) {
-                            $existingConfig.AdditionalServices = $additionalServices
-                            $existingConfig | ConvertTo-Json -Depth 10 | Set-Content $serviceConfigPath -Encoding UTF8
-
-                            Write-Host ""
-                            Write-Host "Additional services configured:" -ForegroundColor Cyan
-                            foreach ($svc in $additionalServices.Keys) {
-                                Write-Host "  - ${svc}: $($additionalServices[$svc].LocalPort)" -ForegroundColor Gray
-                            }
-                            Write-Host "  Configuration updated!" -ForegroundColor Green
-                        }
-                    }
-
-                    Write-Host ""
-                }
-            }
-            catch {
-                Write-Warning "Could not read existing configuration: $($_.Exception.Message)"
-            }
-        }
+    if (-not $serviceConfigPath) {
+        Write-Host "⚠️  No service SSH keys configured!" -ForegroundColor Yellow
+        Write-Host "   The service requires dedicated SSH keys to run as SYSTEM" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "   TunnelMonitor can use existing OllamaTunnelMonitor keys if you have them" -ForegroundColor Cyan
+        Write-Host "   Or generate new keys with these commands:" -ForegroundColor White
+        Write-Host ""
+        Write-Host "   1. Import-Module OllamaTools" -ForegroundColor Cyan
+        Write-Host "   2. Install-ServiceSSHKey -RemoteHost <host> -RemoteUser <user>" -ForegroundColor Cyan
+        Write-Host "      (Add -CreateAdminKey flag to also create admin-accessible key for testing)" -ForegroundColor Gray
+        Write-Host "   3. Copy public key to remote server's ~/.ssh/authorized_keys" -ForegroundColor Gray
+        Write-Host "   4. Test-ServiceSSHConnection" -ForegroundColor Cyan
+        Write-Host "   5. Install-TunnelService -StartNow" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "   Note: -StartNow will automatically run the service as SYSTEM" -ForegroundColor Gray
+        Write-Host "   Note: SSH keys are compatible with OllamaTunnelMonitor" -ForegroundColor Gray
+        return
     }
 
     try {
@@ -2359,3 +2121,5 @@ if (Test-Path $script:TunnelMonitorConfigFile) {
 
 # Module loaded silently - no output to avoid profile clutter
 # For help, use: Get-Command -Module TunnelMonitor
+
+
