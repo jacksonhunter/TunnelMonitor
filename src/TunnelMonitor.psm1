@@ -1613,6 +1613,55 @@ function Install-TunnelService {
             return
         }
 
+        # Prompt for additional services
+        Write-Host ""
+        $addServices = Read-Host "Do you want to forward additional services? (yes/no)"
+        $additionalServices = @{}
+
+        if ($addServices -eq "yes" -or $addServices -eq "y") {
+            Write-Host ""
+            Write-Host "Enter service names and ports. Press Enter with blank name to finish." -ForegroundColor Gray
+            Write-Host "Common examples: VisionAPI=5000, Samba=445, Jupyter=8888" -ForegroundColor Gray
+            Write-Host ""
+
+            while ($true) {
+                $serviceName = Read-Host "Service name (or blank to finish)"
+                if ([string]::IsNullOrWhiteSpace($serviceName)) {
+                    break
+                }
+
+                $portInput = Read-Host "Port for ${serviceName}"
+                if ([string]::IsNullOrWhiteSpace($portInput)) {
+                    Write-Warning "Skipping $serviceName - no port specified"
+                    continue
+                }
+
+                # Try to parse as integer
+                $port = 0
+                if ([int]::TryParse($portInput, [ref]$port)) {
+                    $additionalServices[$serviceName] = @{
+                        LocalPort = $port
+                        RemotePort = $port
+                        RemoteHost = "localhost"
+                    }
+                    Write-Host "  Added: $serviceName on port $port" -ForegroundColor Green
+                }
+                else {
+                    Write-Warning "Invalid port number: $portInput"
+                }
+            }
+
+            if ($additionalServices.Count -gt 0) {
+                Write-Host ""
+                Write-Host "Additional services configured:" -ForegroundColor Cyan
+                foreach ($svc in $additionalServices.Keys) {
+                    Write-Host "  - ${svc}: $($additionalServices[$svc].LocalPort)" -ForegroundColor Gray
+                }
+            }
+        }
+
+        Write-Host ""
+
         # Generate SSH key pair
         Write-Host "  Generating Ed25519 key pair..." -ForegroundColor Gray
         $sshKeyGenOutput = ssh-keygen -t ed25519 -f $serviceKeyFile -N '""' -C "TunnelMonitorService-SYSTEM" 2>&1
@@ -1671,6 +1720,11 @@ function Install-TunnelService {
             PrivateKeyPath = $serviceKeyFile
             LocalPort = 11434
             RemotePort = 11434
+        }
+
+        # Add additional services if configured
+        if ($additionalServices.Count -gt 0) {
+            $serviceConfig.AdditionalServices = $additionalServices
         }
 
         # Save configuration
