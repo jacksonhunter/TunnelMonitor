@@ -502,7 +502,12 @@ function Start-ManagedSSHTunnel {
                 try {
                     $acl = Get-Acl $serviceConfig.PrivateKeyPath
                     Write-Log "Key owner: $($acl.Owner)" -Level Debug
-                    $accessList = $acl.Access | ForEach-Object { "$($_.IdentityReference): $($_.FileSystemRights)" }
+                    # Build permission string to avoid parser issues
+                    $accessList = $acl.Access | ForEach-Object {
+                        $identity = $_.IdentityReference
+                        $rights = $_.FileSystemRights
+                        "${identity}: ${rights}"
+                    }
                     Write-Log "Key permissions: $($accessList -join '; ')" -Level Debug
                 }
                 catch {
@@ -568,9 +573,16 @@ function Start-ManagedSSHTunnel {
             Write-Log "Configuring $($script:TunnelMonitorConfig.AdditionalServices.Count) additional service(s) for forwarding"
             foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
                 $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+
+                # Build port mapping string to avoid parser issues with colons after subexpressions
+                $localP = $svc.LocalPort
+                $remoteH = $svc.RemoteHost
+                $remoteP = $svc.RemotePort
+                $portMapping = "${localP}:${remoteH}:${remoteP}"
+
                 $sshArgs += "-L"
-                $sshArgs += "$($svc.LocalPort):$($svc.RemoteHost):$($svc.RemotePort)"
-                Write-Log "  - $serviceName`: $($svc.LocalPort) -> $($svc.RemoteHost):$($svc.RemotePort)"
+                $sshArgs += $portMapping
+                Write-Log "  - ${serviceName}: $localP -> ${remoteH}:${remoteP}"
             }
         }
 
@@ -1315,7 +1327,7 @@ function Set-TunnelConfiguration {
                     RemotePort = $remotePort
                     RemoteHost = $remoteHost
                 }
-                Write-Verbose "Added service '$serviceName' forwarding $localPort -> $remoteHost:$remotePort"
+                Write-Verbose "Added service '$serviceName' forwarding $localPort -> ${remoteHost}:${remotePort}"
             }
             else {
                 Write-Warning "Invalid configuration for service '$serviceName' - must be int or hashtable"
