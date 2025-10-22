@@ -499,7 +499,7 @@ function Get-RemoteGPUStatus {
     param(
         [string]$SSHHost = "192.168.50.194",
 
-        [string]$SSHUser = "user",
+        [string]$SSHUser,
 
         [string]$SSHKeyPath
     )
