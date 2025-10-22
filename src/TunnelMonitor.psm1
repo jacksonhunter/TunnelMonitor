@@ -1625,26 +1625,26 @@ function Install-TunnelService {
             Write-Host ""
 
             while ($true) {
-                $serviceName = Read-Host "Service name (or blank to finish)"
-                if ([string]::IsNullOrWhiteSpace($serviceName)) {
+                $svcName = Read-Host "Service name (or blank to finish)"
+                if ([string]::IsNullOrWhiteSpace($svcName)) {
                     break
                 }
 
-                $portInput = Read-Host "Port for ${serviceName}"
+                $portInput = Read-Host "Port for ${svcName}"
                 if ([string]::IsNullOrWhiteSpace($portInput)) {
-                    Write-Warning "Skipping $serviceName - no port specified"
+                    Write-Warning "Skipping $svcName - no port specified"
                     continue
                 }
 
                 # Try to parse as integer
                 $port = 0
                 if ([int]::TryParse($portInput, [ref]$port)) {
-                    $additionalServices[$serviceName] = @{
+                    $additionalServices[$svcName] = @{
                         LocalPort = $port
                         RemotePort = $port
                         RemoteHost = "localhost"
                     }
-                    Write-Host "  Added: $serviceName on port $port" -ForegroundColor Green
+                    Write-Host "  Added: $svcName on port $port" -ForegroundColor Green
                 }
                 else {
                     Write-Warning "Invalid port number: $portInput"
@@ -1791,25 +1791,25 @@ function Install-TunnelService {
                         Write-Host ""
 
                         while ($true) {
-                            $serviceName = Read-Host "Service name (or blank to finish)"
-                            if ([string]::IsNullOrWhiteSpace($serviceName)) {
+                            $svcName = Read-Host "Service name (or blank to finish)"
+                            if ([string]::IsNullOrWhiteSpace($svcName)) {
                                 break
                             }
 
-                            $portInput = Read-Host "Port for ${serviceName}"
+                            $portInput = Read-Host "Port for ${svcName}"
                             if ([string]::IsNullOrWhiteSpace($portInput)) {
-                                Write-Warning "Skipping $serviceName - no port specified"
+                                Write-Warning "Skipping $svcName - no port specified"
                                 continue
                             }
 
                             $port = 0
                             if ([int]::TryParse($portInput, [ref]$port)) {
-                                $additionalServices[$serviceName] = @{
+                                $additionalServices[$svcName] = @{
                                     LocalPort = $port
                                     RemotePort = $port
                                     RemoteHost = "localhost"
                                 }
-                                Write-Host "  Added: $serviceName on port $port" -ForegroundColor Green
+                                Write-Host "  Added: $svcName on port $port" -ForegroundColor Green
                             }
                             else {
                                 Write-Warning "Invalid port number: $portInput"
