@@ -59,6 +59,14 @@ $script:TunnelMonitorConfig = @{
         CacheTimeout      = 30           # seconds
         MaxResponseTime   = 100          # milliseconds target
     }
+
+    # Additional Services Configuration (Multi-Port Forwarding)
+    AdditionalServices = @{
+        # ServiceName = @{LocalPort=X; RemotePort=Y; RemoteHost="localhost"}
+        # OR simplified: ServiceName = Port (assumes same local/remote)
+        # Example: VisionAPI = 5000
+        # Example: Samba = @{LocalPort=445; RemotePort=445; RemoteHost="localhost"}
+    }
 }
 
 # Global state containers
@@ -280,17 +288,30 @@ function Get-ExistingSSHTunnel {
     param()
 
     try {
+        # Build list of all expected forwarded ports
+        $expectedPorts = @($script:TunnelMonitorConfig.Target.LocalPort)
+
+        foreach ($svcName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+            $expectedPorts += $script:TunnelMonitorConfig.AdditionalServices[$svcName].LocalPort
+        }
+
         # Check for SSH processes with our specific tunnel configuration
         $sshProcesses = Get-Process -Name "ssh" -ErrorAction SilentlyContinue
 
         foreach ($process in $sshProcesses) {
             try {
                 $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue).CommandLine
-                # Check for our standard tunnel pattern - be more flexible with detection
-                # Look for port forwarding to 11434 (Ollama's default port)
-                if ($commandLine -like "*-L*11434:localhost:11434*" -or
-                    $commandLine -like "*-L*11434:*:11434*" -or
-                    $commandLine -like "*$($script:TunnelMonitorConfig.Target.LocalPort):localhost:$($script:TunnelMonitorConfig.Target.RemotePort)*") {
+
+                # Check if command line contains ANY of our configured ports
+                $foundPort = $false
+                foreach ($port in $expectedPorts) {
+                    if ($commandLine -like "*-L*${port}:*" -or $commandLine -like "*-L*:*:${port}*") {
+                        $foundPort = $true
+                        break
+                    }
+                }
+
+                if ($foundPort) {
                     Write-Log "Found existing SSH tunnel (PID: $($process.Id))" -Level Debug
                     return @{
                         ProcessId = $process.Id
@@ -540,6 +561,21 @@ function Start-ManagedSSHTunnel {
         $sshArgs = @(
             "-N"  # No remote command execution
             "-L", "${localPortNum}:localhost:${remotePortNum}"
+        )
+
+        # Add additional services (multi-port forwarding)
+        if ($script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
+            Write-Log "Configuring $($script:TunnelMonitorConfig.AdditionalServices.Count) additional service(s) for forwarding"
+            foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+                $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+                $sshArgs += "-L"
+                $sshArgs += "$($svc.LocalPort):$($svc.RemoteHost):$($svc.RemotePort)"
+                Write-Log "  - $serviceName`: $($svc.LocalPort) -> $($svc.RemoteHost):$($svc.RemotePort)"
+            }
+        }
+
+        # Add SSH options
+        $sshArgs += @(
             "-o", "TCPKeepAlive=yes"  # Enable TCP-level keepalives
             "-o", "ServerAliveInterval=30"  # Reduced from 60 for faster detection
             "-o", "ServerAliveCountMax=3"
@@ -967,6 +1003,100 @@ function Export-ModelEnvironmentVariables {
 # UNIFIED STATUS AND CONFIGURATION FUNCTIONS
 # --------------------------------------------------------------------------------------------------------
 
+function Test-TCPPort {
+    <#
+    .SYNOPSIS
+    Test TCP connectivity to a local port
+
+    .DESCRIPTION
+    Internal helper function to test if a TCP port is listening
+
+    .PARAMETER Port
+    The port number to test
+
+    .PARAMETER Timeout
+    Timeout in milliseconds (default 2000)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int]$Port,
+
+        [int]$Timeout = 2000
+    )
+
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $connect = $tcpClient.BeginConnect("localhost", $Port, $null, $null)
+        $portStatus = $connect.AsyncWaitHandle.WaitOne($Timeout, $false)
+        if ($portStatus) { $tcpClient.EndConnect($connect) }
+        $tcpClient.Close()
+        return $portStatus
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-TunnelPorts {
+    <#
+    .SYNOPSIS
+    Test connectivity to all forwarded tunnel ports
+
+    .DESCRIPTION
+    Performs quick TCP connectivity checks on main service and all additional services.
+    Does NOT perform HTTP/application-level checks - just port listening status.
+
+    .EXAMPLE
+    Test-TunnelPorts
+
+    .EXAMPLE
+    Test-TunnelPorts | Where-Object {-not $_.Listening}  # Show only failed ports
+    #>
+    [CmdletBinding()]
+    param()
+
+    $results = @()
+
+    # Test main service
+    $mainPort = $script:TunnelMonitorConfig.Target.LocalPort
+    $start = Get-Date
+    $listening = Test-TCPPort -Port $mainPort
+    $responseTime = if ($listening) {
+        [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
+    } else {
+        -1
+    }
+
+    $results += [PSCustomObject]@{
+        ServiceName = "Main"
+        Port = $mainPort
+        Listening = $listening
+        ResponseTimeMs = $responseTime
+    }
+
+    # Test additional services
+    foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+        $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+        $start = Get-Date
+        $listening = Test-TCPPort -Port $svc.LocalPort
+        $responseTime = if ($listening) {
+            [math]::Round(((Get-Date) - $start).TotalMilliseconds, 1)
+        } else {
+            -1
+        }
+
+        $results += [PSCustomObject]@{
+            ServiceName = $serviceName
+            Port = $svc.LocalPort
+            Listening = $listening
+            ResponseTimeMs = $responseTime
+        }
+    }
+
+    return $results
+}
+
 function Get-TunnelStatus {
     <#
     .SYNOPSIS
@@ -1003,6 +1133,7 @@ function Get-TunnelStatus {
         ModelCount = 0
         ResponseTimeMs = -1
         Status = "Unknown"
+        AdditionalServices = @()
         Timestamp = Get-Date
     }
 
@@ -1085,8 +1216,27 @@ function Get-TunnelStatus {
         }
     }
 
+    # Check additional services (if not Quick mode)
+    if ($Check -ne 'Quick' -and $script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
+        foreach ($serviceName in $script:TunnelMonitorConfig.AdditionalServices.Keys) {
+            $svc = $script:TunnelMonitorConfig.AdditionalServices[$serviceName]
+
+            $svcStatus = [PSCustomObject]@{
+                Name = $serviceName
+                Port = $svc.LocalPort
+                Listening = (Test-TCPPort -Port $svc.LocalPort)
+            }
+
+            $status.AdditionalServices += $svcStatus
+        }
+    }
+
     # Determine overall status
-    $status.Status = if ($status.APIResponding -and $status.PortListening) { "Operational" }
+    # If any additional service is down, mark as Partial
+    $additionalServicesDown = $status.AdditionalServices | Where-Object {-not $_.Listening}
+
+    $status.Status = if ($status.APIResponding -and $status.PortListening -and -not $additionalServicesDown) { "Operational" }
+                    elseif (($status.PortListening -or $status.APIResponding) -and $additionalServicesDown) { "Partial" }
                     elseif ($status.PortListening) { "Partial" }
                     elseif ($status.TunnelProcessAlive) { "Connecting" }
                     elseif ($status.ServiceRunning) { "Starting" }
@@ -1101,6 +1251,15 @@ function Set-TunnelConfiguration {
     <#
     .SYNOPSIS
     Configure SSH tunnel settings
+
+    .DESCRIPTION
+    Configure SSH tunnel with optional multi-service port forwarding.
+
+    .PARAMETER AdditionalServices
+    Hashtable of additional services to forward. Key = ServiceName, Value = Port or @{LocalPort=X; RemotePort=Y}
+
+    .EXAMPLE
+    Set-TunnelConfiguration -SSHHost "server" -SSHUser "user" -AdditionalServices @{VisionAPI=5000; Samba=445}
     #>
     [CmdletBinding()]
     param(
@@ -1108,7 +1267,8 @@ function Set-TunnelConfiguration {
         [string]$SSHUser,
         [string]$SSHKeyPath,
         [int]$LocalPort = 11434,
-        [int]$RemotePort = 11434
+        [int]$RemotePort = 11434,
+        [hashtable]$AdditionalServices
     )
 
     # Update configuration
@@ -1128,11 +1288,52 @@ function Set-TunnelConfiguration {
         $script:TunnelMonitorConfig.Target.RemotePort = $RemotePort
     }
 
+    # Handle additional services
+    if ($PSBoundParameters.ContainsKey('AdditionalServices')) {
+        $script:TunnelMonitorConfig.AdditionalServices = @{}
+
+        foreach ($serviceName in $AdditionalServices.Keys) {
+            $serviceConfig = $AdditionalServices[$serviceName]
+
+            if ($serviceConfig -is [int]) {
+                # Simplified: ServiceName = Port (same local/remote)
+                $script:TunnelMonitorConfig.AdditionalServices[$serviceName] = @{
+                    LocalPort = $serviceConfig
+                    RemotePort = $serviceConfig
+                    RemoteHost = "localhost"
+                }
+                Write-Verbose "Added service '$serviceName' forwarding port $serviceConfig"
+            }
+            elseif ($serviceConfig -is [hashtable]) {
+                # Full config: ServiceName = @{LocalPort=X; RemotePort=Y; RemoteHost=Z}
+                $localPort = $serviceConfig.LocalPort
+                $remotePort = if ($serviceConfig.ContainsKey('RemotePort')) { $serviceConfig.RemotePort } else { $localPort }
+                $remoteHost = if ($serviceConfig.ContainsKey('RemoteHost')) { $serviceConfig.RemoteHost } else { "localhost" }
+
+                $script:TunnelMonitorConfig.AdditionalServices[$serviceName] = @{
+                    LocalPort = $localPort
+                    RemotePort = $remotePort
+                    RemoteHost = $remoteHost
+                }
+                Write-Verbose "Added service '$serviceName' forwarding $localPort -> $remoteHost:$remotePort"
+            }
+            else {
+                Write-Warning "Invalid configuration for service '$serviceName' - must be int or hashtable"
+            }
+        }
+    }
+
     # Save to file
     Initialize-DataPath
     $script:TunnelMonitorConfig | ConvertTo-Json -Depth 10 | Set-Content -Path $script:TunnelMonitorConfigFile -Encoding UTF8
 
-    Write-Host "Configuration updated successfully" -ForegroundColor Green
+    if ($script:TunnelMonitorConfig.AdditionalServices.Count -gt 0) {
+        Write-Host "Configuration updated successfully with $($script:TunnelMonitorConfig.AdditionalServices.Count) additional service(s)" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Configuration updated successfully" -ForegroundColor Green
+    }
+
     return $script:TunnelMonitorConfig.Target
 }
 

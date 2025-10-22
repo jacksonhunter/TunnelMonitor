@@ -48,8 +48,9 @@
         'Export-ModelEnvironmentVariables', # Export models to env vars
         'Get-RemoteGPUStatus',             # Get remote GPU status
 
-        # Status (1)
+        # Status (2)
         'Get-TunnelStatus',                # Get service and API status
+        'Test-TunnelPorts',                # Test all forwarded ports
 
         # Internal - Required by service script
         'Write-Log'                        # Write to service log (used by service)
