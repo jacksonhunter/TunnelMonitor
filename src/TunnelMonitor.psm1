@@ -1764,10 +1764,79 @@ function Install-TunnelService {
 
         Write-Host ""
     }
-    elseif (-not (Test-Path $serviceConfigPath)) {
-        Write-Host "⚠️  SSH keys exist but configuration is missing!" -ForegroundColor Yellow
-        Write-Host "   Run Set-TunnelConfiguration to create the config, or delete the keys and reinstall." -ForegroundColor Gray
-        return
+    else {
+        # Keys and config exist - check if we should add additional services
+        if (Test-Path $serviceConfigPath) {
+            try {
+                $existingConfig = Get-Content $serviceConfigPath -Raw | ConvertFrom-Json -AsHashtable
+
+                # Check if AdditionalServices is missing or empty
+                $hasAdditionalServices = $existingConfig.ContainsKey('AdditionalServices') -and
+                                        $existingConfig.AdditionalServices -and
+                                        $existingConfig.AdditionalServices.Count -gt 0
+
+                if (-not $hasAdditionalServices) {
+                    Write-Host ""
+                    Write-Host "Existing SSH keys found. Configuration loaded." -ForegroundColor Green
+                    Write-Host ""
+
+                    # Prompt to add additional services
+                    $addServices = Read-Host "Do you want to add additional services to forward? (yes/no)"
+                    $additionalServices = @{}
+
+                    if ($addServices -eq "yes" -or $addServices -eq "y") {
+                        Write-Host ""
+                        Write-Host "Enter service names and ports. Press Enter with blank name to finish." -ForegroundColor Gray
+                        Write-Host "Common examples: VisionAPI=5000, Samba=445, Jupyter=8888" -ForegroundColor Gray
+                        Write-Host ""
+
+                        while ($true) {
+                            $serviceName = Read-Host "Service name (or blank to finish)"
+                            if ([string]::IsNullOrWhiteSpace($serviceName)) {
+                                break
+                            }
+
+                            $portInput = Read-Host "Port for ${serviceName}"
+                            if ([string]::IsNullOrWhiteSpace($portInput)) {
+                                Write-Warning "Skipping $serviceName - no port specified"
+                                continue
+                            }
+
+                            $port = 0
+                            if ([int]::TryParse($portInput, [ref]$port)) {
+                                $additionalServices[$serviceName] = @{
+                                    LocalPort = $port
+                                    RemotePort = $port
+                                    RemoteHost = "localhost"
+                                }
+                                Write-Host "  Added: $serviceName on port $port" -ForegroundColor Green
+                            }
+                            else {
+                                Write-Warning "Invalid port number: $portInput"
+                            }
+                        }
+
+                        # Update existing config with additional services
+                        if ($additionalServices.Count -gt 0) {
+                            $existingConfig.AdditionalServices = $additionalServices
+                            $existingConfig | ConvertTo-Json -Depth 10 | Set-Content $serviceConfigPath -Encoding UTF8
+
+                            Write-Host ""
+                            Write-Host "Additional services configured:" -ForegroundColor Cyan
+                            foreach ($svc in $additionalServices.Keys) {
+                                Write-Host "  - ${svc}: $($additionalServices[$svc].LocalPort)" -ForegroundColor Gray
+                            }
+                            Write-Host "  Configuration updated!" -ForegroundColor Green
+                        }
+                    }
+
+                    Write-Host ""
+                }
+            }
+            catch {
+                Write-Warning "Could not read existing configuration: $($_.Exception.Message)"
+            }
+        }
     }
 
     try {
