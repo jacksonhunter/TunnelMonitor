@@ -1364,6 +1364,7 @@ function Get-TunnelConfiguration {
         LocalPort = $script:TunnelMonitorConfig.Target.LocalPort
         RemotePort = $script:TunnelMonitorConfig.Target.RemotePort
         APIUrl = $script:TunnelMonitorConfig.Target.OllamaApiUrl
+        AdditionalServices = $script:TunnelMonitorConfig.AdditionalServices
     }
 }
 
